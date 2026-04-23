@@ -1,0 +1,305 @@
+
+--6.film_in_stock, film_not_in_stock, inventory_in_stock, get_customer_balance, 
+--inventory_held_by_customer, rewards_report, last_day
+
+--6.1
+SELECT *
+FROM public.films_in_stock_by_title('love');
+
+-- gets me the movies that are in stock 
+-- has two parameters store id and film if so it checks if in the specific store is the specific movie available
+-- the function returns inventory IDs of available copies of a film in a store.
+
+
+
+
+SELECT *
+FROM public.film_not_in_stock(374,3);
+-- this is the inverse of the previous function.
+--returns currently unavailable copies 
+
+
+-- check find the real film_id and store_id
+select a.film_id, b.store_id from public.film a
+left join public.inventory b
+on a.film_id = b.film_id
+where a.title ilike 'GRAFFITI LOVE'
+
+
+--inventory_in_stock:
+--Checks whether a specific inventory item is available for rent 
+--Returns TRUE if the item has no active rentals or all rentals are returned; otherwise returns FALSE.
+-- The usual implementation checks rental rows for that inventory item:
+
+
+--get_customer_balance:
+--Calculates the current balance for a customer as of a given date. 
+--It includes rental fees, late fees, and replacement costs, and subtracts all payments made before the specified date.
+
+--inventory_held_by_customer:
+--Returns all inventory items currently rented by a specific customer (items that have not yet been returned).
+
+--rewards_report:
+--Generates a report of customers eligible for rewards based on their rental activity and payment history.
+
+--last_day:
+--Returns the last day of the month for a given date.
+
+
+--6.2
+--1. Why does 'rewards_report' return 0 rows?
+
+-- my date range does not match my data period 
+
+SELECT COUNT(*)
+FROM payment
+WHERE payment_date BETWEEN 
+      date '2026-01-01' AND date '2026-01-31';
+
+
+-- new function
+CREATE OR REPLACE FUNCTION public.rewards_report(
+    min_monthly_purchases integer,
+    min_dollar_amount_purchased numeric
+)
+RETURNS SETOF customer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    max_payment_date DATE;
+    start_date DATE;
+    end_date DATE;
+BEGIN
+
+    /*
+    Explanation:
+
+    1. Parameter usage:
+       - min_monthly_purchases: minimum number of transactions required
+       - min_dollar_amount_purchased: minimum total spending required
+
+    2. Date logic:
+       - We use MAX(payment_date) instead of CURRENT_DATE because
+         DVD Rental is a historical dataset.
+       - We calculate a rolling 1-month window:
+            end_date = MAX(payment_date)
+            start_date = end_date - interval '1 month'
+
+    3. Edge cases:
+       - If no data exists → function returns 0 rows
+       - If parameters are invalid → exception is raised
+    */
+
+    -- sanity checks
+    IF min_monthly_purchases <= 0 THEN
+        RAISE EXCEPTION 'Minimum monthly purchases must be > 0';
+    END IF;
+
+    IF min_dollar_amount_purchased <= 0 THEN
+        RAISE EXCEPTION 'Minimum dollar amount must be > 0';
+    END IF;
+
+    -- get latest available date
+    SELECT MAX(payment_date)::date
+    INTO max_payment_date
+    FROM payment;
+
+    -- handle case when no data exists
+    IF max_payment_date IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- rolling 1-month window
+    end_date := max_payment_date;
+    start_date := max_payment_date - interval '1 month';
+
+    -- debug (optional)
+    RAISE NOTICE 'Period: % to %', start_date, end_date;
+
+    -- main query
+    RETURN QUERY
+    SELECT c.*
+    FROM customer c
+    WHERE c.customer_id IN (
+        SELECT p.customer_id
+        FROM payment p
+        WHERE p.payment_date BETWEEN start_date AND end_date
+        GROUP BY p.customer_id
+        HAVING SUM(p.amount) >= min_dollar_amount_purchased
+           AND COUNT(*) >= min_monthly_purchases
+    );
+
+END;
+$function$;
+
+---comment:
+
+--6.3
+
+-- The function 'rewards_report' is redundant and inefficient because it uses
+-- temporary tables, dynamic SQL, and procedural loops, while the same result
+-- can be achieved using a single set-based query.
+
+
+
+
+--Several functions in the DVD Rental codebase violate best practices:
+
+--'rewards_report' uses dynamic SQL, temporary tables, and procedural loops 
+--instead of set-based logic.
+
+--'film_in_stock' and 'film_not_in_stock' rely on row-by-row processing, 
+--which is inefficient compared to set-based queries.
+
+--'get_customer_balance' is overly complex and could be simplified using 
+--aggregation functions.
+
+--In general, many functions overuse procedural constructs (loops, temp tables) 
+--instead of leveraging PostgreSQL’s strength in set-based operations, 
+--which negatively impacts performance and readability.
+
+--6.4
+
+CREATE OR REPLACE FUNCTION public.get_customer_balance(
+    p_customer_id integer, 
+    p_effective_date timestamp with time zone
+)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_rentfees NUMERIC := 0;
+    v_overfees NUMERIC := 0;
+    v_payments NUMERIC := 0;
+BEGIN
+
+    /*
+    1) Rental fees for all previous rentals
+    */
+    SELECT COALESCE(SUM(f.rental_rate), 0)
+    INTO v_rentfees
+    FROM rental r
+    JOIN inventory i ON r.inventory_id = i.inventory_id
+    JOIN film f ON i.film_id = f.film_id
+    WHERE r.customer_id = p_customer_id
+      AND r.rental_date <= p_effective_date;
+
+
+    /*
+    2) Overdue fees + 3) Replacement cost rule
+    */
+    SELECT COALESCE(SUM(
+        CASE
+            -- determine actual return date (or effective date if not returned)
+            WHEN (
+                (COALESCE(r.return_date, p_effective_date) - r.rental_date)
+                > (f.rental_duration * interval '2 day')
+            )
+            THEN f.replacement_cost  -- rule 3
+
+            WHEN (
+                (COALESCE(r.return_date, p_effective_date) - r.rental_date)
+                > (f.rental_duration * interval '1 day')
+            )
+            THEN 
+                -- rule 2: $1 per overdue day
+                FLOOR(
+                    EXTRACT(EPOCH FROM (
+                        (COALESCE(r.return_date, p_effective_date) - r.rental_date)
+                        - (f.rental_duration * interval '1 day')
+                    )) / 86400
+                )
+
+            ELSE 0
+        END
+    ), 0)
+    INTO v_overfees
+    FROM rental r
+    JOIN inventory i ON r.inventory_id = i.inventory_id
+    JOIN film f ON i.film_id = f.film_id
+    WHERE r.customer_id = p_customer_id
+      AND r.rental_date <= p_effective_date;
+
+
+    /*
+    4) Payments made before effective date
+    */
+    SELECT COALESCE(SUM(p.amount), 0)
+    INTO v_payments
+    FROM payment p
+    WHERE p.customer_id = p_customer_id
+      AND p.payment_date <= p_effective_date;
+
+
+    RETURN v_rentfees + v_overfees - v_payments;
+
+END;
+$function$;
+
+--6.5 How do ‘group_concat’ and ‘_group_concat’ functions work? 
+
+/*
+1. _group_concat(text, text)
+
+- This is a custom helper function used for string aggregation.
+- It concatenates two text values into one string separated by ", ".
+- It is mainly used in grouped queries or reporting logic in older implementations.
+
+Where it is used:
+- In aggregation logic to combine multiple text values into one result.
+
+Limitations:
+- It does not guarantee ordering of values → result can be inconsistent
+
+
+--6.5 last_updated()
+
+- This is a trigger function used to automatically update the last_update column.
+- Every time a row is updated, it sets last_update = CURRENT_TIMESTAMP.
+
+Where it is used:
+- Attached to BEFORE UPDATE triggers on tables (for example customer, rental, etc.)
+
+Purpose:
+- To track changes in records automatically without manual updates
+
+
+3. tmpSQL in rewards_report function
+
+- tmpSQL is a variable used to store dynamically built SQL query as text.
+- It is executed using EXECUTE (dynamic SQL).
+
+What it is used for:
+- To build INSERT query dynamically with parameters (dates, thresholds)
+
+Why it is not optimal:
+- The query structure is static, so dynamic SQL is not needed
+- Makes function harder to read and maintain
+- Prevents PostgreSQL from optimizing query execution plan properly
+- Increases complexity and is unnecessary in this case
+
+Better solution:
+- Use normal set-based SQL with JOIN, GROUP BY, HAVING instead of EXECUTE
+
+
+4. Can any function produce incorrect results?
+
+Yes, some functions can produce incorrect or inconsistent results due to design issues:
+
+- _group_concat:
+  -> Does not guarantee order → output can be inconsistent
+
+- rewards_report:
+  -> Depends on correct interpretation of date range
+  -> If boundaries are not handled properly, some rows may be missed or duplicated
+
+General issue:
+- Most functions use procedural logic instead of set-based SQL
+- This can lead to inefficiency and sometimes logical inaccuracies
+
+*/
+
+
+
+
